@@ -319,6 +319,15 @@ func onDropTableOrView(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, _ er
 				return ver, errors.Trace(err)
 			}
 		}
+<<<<<<< HEAD
+=======
+		if tblInfo.TiFlashReplica != nil {
+			e := infosync.DeleteTiFlashTableSyncProgress(tblInfo)
+			if e != nil {
+				logutil.BgLogger().Error("DeleteTiFlashTableSyncProgress fails", zap.Error(e))
+			}
+		}
+>>>>>>> c52b5a70d1 (DDL: delete partition table tiflash replica progress from ETCD when truncate table, drop table, set tiflash replica 0 (#38551))
 		// Placement rules cannot be removed immediately after drop table / truncate table, because the
 		// tables can be flashed back or recovered, therefore it moved to doGCPlacementRules in gc_worker.go.
 
@@ -645,6 +654,14 @@ func onTruncateTable(d *ddlCtx, t *meta.Meta, job *model.Job) (ver int64, _ erro
 			failpoint.Return(ver, errors.New("occur an error after dropping table"))
 		}
 	})
+
+	// Clear the TiFlash replica progress from ETCD.
+	if tblInfo.TiFlashReplica != nil {
+		e := infosync.DeleteTiFlashTableSyncProgress(tblInfo)
+		if e != nil {
+			logutil.BgLogger().Error("DeleteTiFlashTableSyncProgress fails", zap.Error(e))
+		}
+	}
 
 	var oldPartitionIDs []int64
 	if tblInfo.GetPartitionInfo() != nil {
@@ -1112,6 +1129,12 @@ func (w *worker) onSetTableFlashReplica(d *ddlCtx, t *meta.Meta, job *model.Job)
 			LocationLabels: replicaInfo.Labels,
 		}
 	} else {
+		if tblInfo.TiFlashReplica != nil {
+			err = infosync.DeleteTiFlashTableSyncProgress(tblInfo)
+			if err != nil {
+				logutil.BgLogger().Error("DeleteTiFlashTableSyncProgress fails", zap.Error(err))
+			}
+		}
 		tblInfo.TiFlashReplica = nil
 	}
 
