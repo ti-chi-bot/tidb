@@ -2194,8 +2194,46 @@ func (do *Domain) UpdateTableStatsLoop(ctx, initStatsCtx sessionctx.Context) err
 	}
 	do.SetStatsUpdating(true)
 	do.wg.Run(func() { do.updateStatsWorker(ctx, owner) }, "updateStatsWorker")
+<<<<<<< HEAD:domain/domain.go
 	do.wg.Run(func() { do.autoAnalyzeWorker(owner) }, "autoAnalyzeWorker")
 	do.wg.Run(func() { do.gcAnalyzeHistory(owner) }, "gcAnalyzeHistory")
+=======
+	// Wait for the stats worker to finish the initialization.
+	// Otherwise, we may start the auto analyze worker before the stats cache is initialized.
+	do.wg.Run(
+		func() {
+			<-do.StatsHandle().InitStatsDone
+			do.autoAnalyzeWorker(owner)
+		},
+		"autoAnalyzeWorker",
+	)
+	do.wg.Run(
+		func() {
+			<-do.StatsHandle().InitStatsDone
+			do.analyzeJobsCleanupWorker(owner)
+		},
+		"analyzeJobsCleanupWorker",
+	)
+	do.wg.Run(
+		func() {
+			// The initStatsCtx is used to store the internal session for initializing stats,
+			// so we need the gc min start ts calculation to track it as an internal session.
+			// Since the session manager may not be ready at this moment, `infosync.StoreInternalSession` can fail.
+			// we need to retry until the session manager is ready or the init stats completes.
+			for !infosync.StoreInternalSession(initStatsCtx) {
+				waitRetry := time.After(time.Second)
+				select {
+				case <-do.StatsHandle().InitStatsDone:
+					return
+				case <-waitRetry:
+				}
+			}
+			<-do.StatsHandle().InitStatsDone
+			infosync.DeleteInternalSession(initStatsCtx)
+		},
+		"RemoveInitStatsFromInternalSessions",
+	)
+>>>>>>> bf704fd635c (domain: make the transaction from `initStatsCtx` blocking gc (#53602)):pkg/domain/domain.go
 	return nil
 }
 

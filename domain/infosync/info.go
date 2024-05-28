@@ -1333,16 +1333,22 @@ func ConfigureTiFlashPDForPartitions(accel bool, definitions *[]model.PartitionD
 }
 
 // StoreInternalSession is the entry function for store an internal session to SessionManager.
+<<<<<<< HEAD:domain/infosync/info.go
 func StoreInternalSession(se interface{}) {
+=======
+// return whether the session is stored successfully.
+func StoreInternalSession(se any) bool {
+>>>>>>> bf704fd635c (domain: make the transaction from `initStatsCtx` blocking gc (#53602)):pkg/domain/infosync/info.go
 	is, err := getGlobalInfoSyncer()
 	if err != nil {
-		return
+		return false
 	}
 	sm := is.GetSessionManager()
 	if sm == nil {
-		return
+		return false
 	}
 	sm.StoreInternalSession(se)
+	return true
 }
 
 // DeleteInternalSession is the entry function for delete an internal session from SessionManager.
