@@ -72,8 +72,8 @@ func TestInitStatsSessionBlockGC(t *testing.T) {
 	}()
 	newConfig := *origConfig
 	for _, lite := range []bool{false, true} {
-		require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/statistics/handle/beforeInitStats", "pause"))
-		require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/pkg/statistics/handle/beforeInitStatsLite", "pause"))
+		require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/statistics/handle/beforeInitStats", "pause"))
+		require.NoError(t, failpoint.Enable("github.com/pingcap/tidb/statistics/handle/beforeInitStatsLite", "pause"))
 		newConfig.Performance.LiteInitStats = lite
 		config.StoreGlobalConfig(&newConfig)
 
@@ -101,8 +101,8 @@ func TestInitStatsSessionBlockGC(t *testing.T) {
 			}
 			return false
 		}, 10*time.Second, 10*time.Millisecond, "min_start_ts is not blocked over 1s")
-		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/statistics/handle/beforeInitStats"))
-		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/pkg/statistics/handle/beforeInitStatsLite"))
+		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/statistics/handle/beforeInitStats"))
+		require.NoError(t, failpoint.Disable("github.com/pingcap/tidb/statistics/handle/beforeInitStatsLite"))
 		dom.Close()
 		require.NoError(t, store.Close())
 	}
