@@ -137,6 +137,11 @@ func newPartitionedTable(tbl *TableCommon, tblInfo *model.TableInfo) (table.Part
 		partitions[p.ID] = &t
 	}
 	ret.partitions = partitions
+	if pi.DDLAction != model.ActionReorganizePartition &&
+		pi.DDLAction != model.ActionRemovePartitioning &&
+		pi.DDLAction != model.ActionAlterTablePartitioning {
+		return ret, nil
+	}
 	// In StateWriteReorganization we are using the 'old' partition definitions
 	// and if any new change happens in DroppingDefinitions, it needs to be done
 	// also in AddingDefinitions (with new evaluation of the new expression)
@@ -1228,23 +1233,60 @@ func (t *partitionedTable) locatePartitionCommon(ctx sessionctx.Context, pi *mod
 		} else {
 			idx, err = t.locateRangeColumnPartition(ctx, partitionExpr, r)
 		}
+<<<<<<< HEAD:table/tables/partition.go
 	case model.PartitionTypeHash:
+=======
+		if err != nil {
+			return -1, err
+		}
+		pi := t.Meta().Partition
+		if pi.CanHaveOverlappingDroppingPartition() {
+			if pi.IsDropping(idx) {
+				// Give an error, since it should not be written to!
+				// For read it can check the Overlapping partition and ignore the error.
+				// One should use the next non-dropping partition for range, or the default
+				// partition for list partitioned table with default partition, for read.
+				return idx, table.ErrNoPartitionForGivenValue.GenWithStackByArgs(fmt.Sprintf("matching a partition being dropped, '%s'", pi.Definitions[idx].Name.String()))
+			}
+		}
+	case pmodel.PartitionTypeHash:
+>>>>>>> 1e24d396082 (*: Drop partition DDL handling for overlapping partitions during State Changes (#56082)):pkg/table/tables/partition.go
 		// Note that only LIST and RANGE supports REORGANIZE PARTITION
 		idx, err = t.locateHashPartition(ctx, partitionExpr, num, r)
 	case model.PartitionTypeKey:
 		idx, err = partitionExpr.LocateKeyPartition(num, r)
+<<<<<<< HEAD:table/tables/partition.go
 	case model.PartitionTypeList:
 		idx, err = t.locateListPartition(ctx, partitionExpr, r)
+=======
+	case pmodel.PartitionTypeList:
+		idx, err = partitionExpr.locateListPartition(ctx, r)
+		pi := t.Meta().Partition
+		if idx != pi.GetOverlappingDroppingPartitionIdx(idx) {
+			return idx, table.ErrNoPartitionForGivenValue.GenWithStackByArgs(fmt.Sprintf("matching a partition being dropped, '%s'", pi.Definitions[idx].Name.String()))
+		}
+	case pmodel.PartitionTypeNone:
+		idx = 0
+>>>>>>> 1e24d396082 (*: Drop partition DDL handling for overlapping partitions during State Changes (#56082)):pkg/table/tables/partition.go
 	}
 	if err != nil {
-		return 0, errors.Trace(err)
+		return -1, errors.Trace(err)
 	}
 	return idx, nil
 }
 
 func (t *partitionedTable) locatePartition(ctx sessionctx.Context, r []types.Datum) (int64, error) {
 	pi := t.Meta().GetPartitionInfo()
+<<<<<<< HEAD:table/tables/partition.go
 	idx, err := t.locatePartitionCommon(ctx, pi, t.partitionExpr, pi.Num, r)
+=======
+	columnsSet := len(t.meta.Partition.Columns) > 0
+	return t.locatePartitionCommon(ctx, pi.Type, t.partitionExpr, pi.Num, columnsSet, r)
+}
+
+func (t *partitionedTable) locatePartition(ctx expression.EvalContext, r []types.Datum) (int64, error) {
+	idx, err := t.locatePartitionIdx(ctx, r)
+>>>>>>> 1e24d396082 (*: Drop partition DDL handling for overlapping partitions during State Changes (#56082)):pkg/table/tables/partition.go
 	if err != nil {
 		return 0, errors.Trace(err)
 	}
