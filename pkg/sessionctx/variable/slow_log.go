@@ -19,6 +19,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/crc64"
+	"math"
 	"regexp"
 	"slices"
 	"strconv"
@@ -29,6 +31,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/pkg/parser/ast"
 	"github.com/pingcap/tidb/pkg/parser/terror"
+	"github.com/pingcap/tidb/pkg/sessionctx/slowlogrule"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	contextutil "github.com/pingcap/tidb/pkg/util/context"
 	"github.com/pingcap/tidb/pkg/util/execdetails"
@@ -59,8 +62,6 @@ const (
 	SlowLogUserStr = "User"
 	// SlowLogHostStr only for slow_query table usage.
 	SlowLogHostStr = "Host"
-	// SlowLogRewriteTimeStr is the rewrite time.
-	SlowLogRewriteTimeStr = "Rewrite_time"
 	// SlowLogPreprocSubQueriesStr is the number of pre-processed sub-queries.
 	SlowLogPreprocSubQueriesStr = "Preproc_subqueries"
 	// SlowLogPreProcSubQueryTimeStr is the total time of pre-processing sub-queries.
@@ -157,6 +158,8 @@ const (
 	SlowLogParseTimeStr = "Parse_time"
 	// SlowLogCompileTimeStr is the compile plan time.
 	SlowLogCompileTimeStr = "Compile_time"
+	// SlowLogRewriteTimeStr is the rewrite time.
+	SlowLogRewriteTimeStr = "Rewrite_time"
 	// SlowLogOptimizeTimeStr is the optimization time.
 	SlowLogOptimizeTimeStr = "Optimize_time"
 	// SlowLogWaitTSTimeStr is the time of waiting TS.
@@ -187,6 +190,10 @@ const (
 	SlowLogExecRetryCount = "Exec_retry_count"
 	// SlowLogResourceGroup is the resource group name that the current session bind.
 	SlowLogResourceGroup = "Resource_group"
+	// SlowLogCopMVCCReadAmplification is total_keys / processed_keys in coprocessor scan detail.
+	SlowLogCopMVCCReadAmplification = "cop_mvcc_read_amplification"
+	// SlowLogSessionConnectAttrs is the session connection attributes from the client.
+	SlowLogSessionConnectAttrs = "Session_connect_attrs"
 )
 
 // JSONSQLWarnForSlowLog helps to print the SQLWarn through the slow log in JSON format.
@@ -234,10 +241,6 @@ type SlowQueryLogItems struct {
 	SQL               string
 	Digest            string
 	TimeTotal         time.Duration
-	TimeParse         time.Duration
-	TimeCompile       time.Duration
-	TimeOptimize      time.Duration
-	TimeWaitTS        time.Duration
 	IndexNames        string
 	CopTasks          *execdetails.CopTasksDetails
 	ExecDetail        *execdetails.ExecDetails
@@ -253,9 +256,6 @@ type SlowQueryLogItems struct {
 	PlanDigest        string
 	BinaryPlan        string
 	RewriteInfo       RewritePhaseInfo
-	KVTotal           time.Duration
-	PDTotal           time.Duration
-	BackoffTotal      time.Duration
 	WriteSQLRespTotal time.Duration
 	KVExecDetail      *util.ExecDetails
 	ExecRetryCount    uint64
@@ -268,12 +268,26 @@ type SlowQueryLogItems struct {
 	Warnings          []JSONSQLWarnForSlowLog
 	ResourceGroupName string
 	RUDetails         *util.RUDetails
-	RRU               float64
-	WRU               float64
-	WaitRUDuration    time.Duration
 	CPUUsages         ppcpuusage.CPUUsages
 	StorageKV         bool // query read from TiKV
 	StorageMPP        bool // query read from TiFlash
+	// SessionConnectAttrs holds the client connection attributes (e.g. _client_name, _os).
+	// This is a shared reference to ConnectionInfo.Attributes and must not be modified.
+	SessionConnectAttrs map[string]string
+}
+
+const zeroStr = "0"
+
+func kvExecDetailFormat(buf *bytes.Buffer, kvExecDetail *util.ExecDetails) {
+	if kvExecDetail == nil {
+		writeSlowLogItem(buf, SlowLogKVTotal, zeroStr)
+		writeSlowLogItem(buf, SlowLogPDTotal, zeroStr)
+		writeSlowLogItem(buf, SlowLogBackoffTotal, zeroStr)
+		return
+	}
+	writeSlowLogItem(buf, SlowLogKVTotal, strconv.FormatFloat(time.Duration(kvExecDetail.WaitKVRespDuration).Seconds(), 'f', -1, 64))
+	writeSlowLogItem(buf, SlowLogPDTotal, strconv.FormatFloat(time.Duration(kvExecDetail.WaitPDRespDuration).Seconds(), 'f', -1, 64))
+	writeSlowLogItem(buf, SlowLogBackoffTotal, strconv.FormatFloat(time.Duration(kvExecDetail.BackoffDuration).Seconds(), 'f', -1, 64))
 }
 
 // SlowLogFormat uses for formatting slow log.
@@ -333,8 +347,8 @@ func (s *SessionVars) SlowLogFormat(logItems *SlowQueryLogItems) string {
 		buf.WriteString("\n")
 	}
 	writeSlowLogItem(&buf, SlowLogQueryTimeStr, strconv.FormatFloat(logItems.TimeTotal.Seconds(), 'f', -1, 64))
-	writeSlowLogItem(&buf, SlowLogParseTimeStr, strconv.FormatFloat(logItems.TimeParse.Seconds(), 'f', -1, 64))
-	writeSlowLogItem(&buf, SlowLogCompileTimeStr, strconv.FormatFloat(logItems.TimeCompile.Seconds(), 'f', -1, 64))
+	writeSlowLogItem(&buf, SlowLogParseTimeStr, strconv.FormatFloat(s.DurationParse.Seconds(), 'f', -1, 64))
+	writeSlowLogItem(&buf, SlowLogCompileTimeStr, strconv.FormatFloat(s.DurationCompile.Seconds(), 'f', -1, 64))
 
 	buf.WriteString(SlowLogRowPrefixStr + fmt.Sprintf("%v%v%v", SlowLogRewriteTimeStr,
 		SlowLogSpaceMarkStr, strconv.FormatFloat(logItems.RewriteInfo.DurationRewrite.Seconds(), 'f', -1, 64)))
@@ -344,8 +358,8 @@ func (s *SessionVars) SlowLogFormat(logItems *SlowQueryLogItems) string {
 	}
 	buf.WriteString("\n")
 
-	writeSlowLogItem(&buf, SlowLogOptimizeTimeStr, strconv.FormatFloat(logItems.TimeOptimize.Seconds(), 'f', -1, 64))
-	writeSlowLogItem(&buf, SlowLogWaitTSTimeStr, strconv.FormatFloat(logItems.TimeWaitTS.Seconds(), 'f', -1, 64))
+	writeSlowLogItem(&buf, SlowLogOptimizeTimeStr, strconv.FormatFloat(s.DurationOptimization.Seconds(), 'f', -1, 64))
+	writeSlowLogItem(&buf, SlowLogWaitTSTimeStr, strconv.FormatFloat(s.DurationWaitTS.Seconds(), 'f', -1, 64))
 
 	if logItems.ExecDetail != nil {
 		if execDetailStr := logItems.ExecDetail.String(); len(execDetailStr) > 0 {
@@ -443,23 +457,7 @@ func (s *SessionVars) SlowLogFormat(logItems *SlowQueryLogItems) string {
 	writeSlowLogItem(&buf, SlowLogPlanFromCache, strconv.FormatBool(logItems.PlanFromCache))
 	writeSlowLogItem(&buf, SlowLogPlanFromBinding, strconv.FormatBool(logItems.PlanFromBinding))
 	writeSlowLogItem(&buf, SlowLogHasMoreResults, strconv.FormatBool(logItems.HasMoreResults))
-	kvTotal := logItems.KVTotal
-	pdTotal := logItems.PDTotal
-	backoffTotal := logItems.BackoffTotal
-	if logItems.KVExecDetail != nil {
-		if kvTotal == 0 {
-			kvTotal = time.Duration(logItems.KVExecDetail.WaitKVRespDuration)
-		}
-		if pdTotal == 0 {
-			pdTotal = time.Duration(logItems.KVExecDetail.WaitPDRespDuration)
-		}
-		if backoffTotal == 0 {
-			backoffTotal = time.Duration(logItems.KVExecDetail.BackoffDuration)
-		}
-	}
-	writeSlowLogItem(&buf, SlowLogKVTotal, strconv.FormatFloat(kvTotal.Seconds(), 'f', -1, 64))
-	writeSlowLogItem(&buf, SlowLogPDTotal, strconv.FormatFloat(pdTotal.Seconds(), 'f', -1, 64))
-	writeSlowLogItem(&buf, SlowLogBackoffTotal, strconv.FormatFloat(backoffTotal.Seconds(), 'f', -1, 64))
+	kvExecDetailFormat(&buf, logItems.KVExecDetail)
 	writeSlowLogItem(&buf, SlowLogWriteSQLRespTotal, strconv.FormatFloat(logItems.WriteSQLRespTotal.Seconds(), 'f', -1, 64))
 	writeSlowLogItem(&buf, SlowLogResultRows, strconv.FormatInt(logItems.ResultRows, 10))
 	if len(logItems.Warnings) > 0 {
@@ -491,28 +489,16 @@ func (s *SessionVars) SlowLogFormat(logItems *SlowQueryLogItems) string {
 	if logItems.ResourceGroupName != "" {
 		writeSlowLogItem(&buf, SlowLogResourceGroup, logItems.ResourceGroupName)
 	}
-	rru := logItems.RRU
-	wru := logItems.WRU
-	waitRUDuration := logItems.WaitRUDuration
 	if logItems.RUDetails != nil {
-		if rru == 0.0 {
-			rru = logItems.RUDetails.RRU()
+		if rru := logItems.RUDetails.RRU(); rru > 0.0 {
+			writeSlowLogItem(&buf, SlowLogRRU, strconv.FormatFloat(rru, 'f', -1, 64))
 		}
-		if wru == 0.0 {
-			wru = logItems.RUDetails.WRU()
+		if wru := logItems.RUDetails.WRU(); wru > 0.0 {
+			writeSlowLogItem(&buf, SlowLogWRU, strconv.FormatFloat(wru, 'f', -1, 64))
 		}
-		if waitRUDuration == 0 {
-			waitRUDuration = logItems.RUDetails.RUWaitDuration()
+		if waitRUDuration := logItems.RUDetails.RUWaitDuration(); waitRUDuration > 0 {
+			writeSlowLogItem(&buf, SlowLogWaitRUDuration, strconv.FormatFloat(waitRUDuration.Seconds(), 'f', -1, 64))
 		}
-	}
-	if rru > 0.0 {
-		writeSlowLogItem(&buf, SlowLogRRU, strconv.FormatFloat(rru, 'f', -1, 64))
-	}
-	if wru > 0.0 {
-		writeSlowLogItem(&buf, SlowLogWRU, strconv.FormatFloat(wru, 'f', -1, 64))
-	}
-	if waitRUDuration > 0 {
-		writeSlowLogItem(&buf, SlowLogWaitRUDuration, strconv.FormatFloat(waitRUDuration.Seconds(), 'f', -1, 64))
 	}
 	if logItems.CPUUsages.TidbCPUTime > time.Duration(0) {
 		writeSlowLogItem(&buf, SlowLogTidbCPUUsageDuration, strconv.FormatFloat(logItems.CPUUsages.TidbCPUTime.Seconds(), 'f', -1, 64))
@@ -522,6 +508,17 @@ func (s *SessionVars) SlowLogFormat(logItems *SlowQueryLogItems) string {
 	}
 	writeSlowLogItem(&buf, SlowLogStorageFromKV, strconv.FormatBool(logItems.StorageKV))
 	writeSlowLogItem(&buf, SlowLogStorageFromMPP, strconv.FormatBool(logItems.StorageMPP))
+	if len(logItems.SessionConnectAttrs) > 0 {
+		// Encode into a temporary buffer first so that a (practically impossible)
+		// encoding error does not leave a partial line in the main buffer.
+		var attrsBuf bytes.Buffer
+		encoder := json.NewEncoder(&attrsBuf)
+		encoder.SetEscapeHTML(false)
+		if err := encoder.Encode(logItems.SessionConnectAttrs); err == nil {
+			buf.WriteString(SlowLogRowPrefixStr + SlowLogSessionConnectAttrs + SlowLogSpaceMarkStr)
+			buf.Write(attrsBuf.Bytes()) // Encode already appends \n
+		}
+	}
 	if logItems.PrevStmt != "" {
 		writeSlowLogItem(&buf, SlowLogPrevStmt, logItems.PrevStmt)
 	}
@@ -542,25 +539,6 @@ func (s *SessionVars) SlowLogFormat(logItems *SlowQueryLogItems) string {
 // writeSlowLogItem writes a slow log item in the form of: "# ${key}:${value}"
 func writeSlowLogItem(buf *bytes.Buffer, key, value string) {
 	buf.WriteString(SlowLogRowPrefixStr + key + SlowLogSpaceMarkStr + value + "\n")
-}
-
-// SlowLogCondition defines a single condition within a slow log rule.
-type SlowLogCondition struct {
-	Field     string // Name of the slow log field to check (e.g., "Conn_ID", "Query_time").
-	Threshold any    // Threshold value for triggering the condition.
-}
-
-// SlowLogRule represents a single slow log rule.
-// A rule is triggered only if **all** of its Conditions are satisfied (logical AND).
-type SlowLogRule struct {
-	Conditions []SlowLogCondition // List of conditions combined with logical AND.
-}
-
-// SlowLogRules represents all slow log rules defined for the current scope (e.g., session/global).
-// The rules are evaluated using logical OR between them: if any rule matches, it triggers the slow log.
-type SlowLogRules struct {
-	AllConditionFields map[string]struct{} // Set of all unique field names used in all conditions.
-	Rules              []SlowLogRule       // List of rules combined with logical OR.
 }
 
 // SlowLogFieldAccessor defines how to get or set a specific field in SlowQueryLogItems.
@@ -586,7 +564,7 @@ func makeExecDetailAccessor(parse func(string) (any, error),
 		},
 		Match: func(_ *SessionVars, items *SlowQueryLogItems, threshold any) bool {
 			if items.ExecDetail == nil {
-				return false
+				return matchZero(threshold)
 			}
 			return match(items.ExecDetail, threshold)
 		},
@@ -607,7 +585,7 @@ func makeKVExecDetailAccessor(parse func(string) (any, error),
 		},
 		Match: func(_ *SessionVars, items *SlowQueryLogItems, threshold any) bool {
 			if items.KVExecDetail == nil {
-				return false
+				return matchZero(threshold)
 			}
 			return match(items.KVExecDetail, threshold)
 		},
@@ -630,12 +608,56 @@ func matchGE[T numericComparable](threshold any, v T) bool {
 	return ok && v >= tv
 }
 
-// ParseString converts the input string to lowercase and returns it.
-func ParseString(v string) (any, error)  { return strings.ToLower(v), nil }
-func parseInt64(v string) (any, error)   { return strconv.ParseInt(v, 10, 64) }
-func parseUint64(v string) (any, error)  { return strconv.ParseUint(v, 10, 64) }
-func parseFloat64(v string) (any, error) { return strconv.ParseFloat(v, 64) }
-func parseBool(v string) (any, error)    { return strconv.ParseBool(v) }
+// uint64FromNonNegative converts a signed value to uint64 if it is non-negative.
+func uint64FromNonNegative(v int64) (uint64, bool) {
+	if v < 0 {
+		return 0, false
+	}
+	return uint64(v), true
+}
+
+func matchZero(threshold any) bool {
+	switch v := threshold.(type) {
+	case int:
+		return v == 0
+	case uint64:
+		return v == 0
+	case int64:
+		return v == 0
+	case float64:
+		return v == 0
+	default:
+		return false
+	}
+}
+
+// ParseString returns the input string as-is.
+func ParseString(v string) (any, error) { return v, nil }
+func parseInt64(v string) (any, error) {
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	if n < 0 {
+		return nil, fmt.Errorf("threshold value must be non-negative, got %d", n)
+	}
+	return n, nil
+}
+func parseUint64(v string) (any, error) { return strconv.ParseUint(v, 10, 64) }
+func parseFloat64(v string) (any, error) {
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		return nil, err
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return nil, fmt.Errorf("threshold value must be finite, got %v", f)
+	}
+	if f < 0 {
+		return nil, fmt.Errorf("threshold value must be non-negative, got %v", f)
+	}
+	return f, nil
+}
+func parseBool(v string) (any, error) { return strconv.ParseBool(v) }
 
 // SlowLogRuleFieldAccessors defines the set of field accessors for SlowQueryLogItems
 // that are relevant to evaluating and triggering SlowLogRules.
@@ -650,13 +672,13 @@ var SlowLogRuleFieldAccessors = map[string]SlowLogFieldAccessor{
 	strings.ToLower(SlowLogSessAliasStr): {
 		Parse: ParseString,
 		Match: func(seVars *SessionVars, _ *SlowQueryLogItems, threshold any) bool {
-			return MatchEqual(threshold, strings.ToLower(seVars.SessionAlias))
+			return MatchEqual(threshold, seVars.SessionAlias)
 		},
 	},
 	strings.ToLower(SlowLogDBStr): {
 		Parse: ParseString,
 		Match: func(seVars *SessionVars, _ *SlowQueryLogItems, threshold any) bool {
-			return MatchEqual(threshold, strings.ToLower(seVars.CurrentDB))
+			return MatchEqual(strings.ToLower(threshold.(string)), strings.ToLower(seVars.CurrentDB))
 		},
 	},
 	strings.ToLower(SlowLogExecRetryCount): {
@@ -689,6 +711,15 @@ var SlowLogRuleFieldAccessors = map[string]SlowLogFieldAccessor{
 			return matchGE(threshold, seVars.DurationCompile.Seconds())
 		},
 	},
+	strings.ToLower(SlowLogRewriteTimeStr): {
+		Parse: parseFloat64,
+		Setter: func(_ context.Context, seVars *SessionVars, items *SlowQueryLogItems) {
+			items.RewriteInfo = seVars.RewritePhaseInfo
+		},
+		Match: func(_ *SessionVars, items *SlowQueryLogItems, threshold any) bool {
+			return matchGE(threshold, items.RewriteInfo.DurationRewrite.Seconds())
+		},
+	},
 	strings.ToLower(SlowLogOptimizeTimeStr): {
 		Parse: parseFloat64,
 		Match: func(seVars *SessionVars, _ *SlowQueryLogItems, threshold any) bool {
@@ -714,7 +745,7 @@ var SlowLogRuleFieldAccessors = map[string]SlowLogFieldAccessor{
 			items.Digest = digest.String()
 		},
 		Match: func(_ *SessionVars, items *SlowQueryLogItems, threshold any) bool {
-			return MatchEqual(threshold, strings.ToLower(items.Digest))
+			return MatchEqual(threshold, items.Digest)
 		},
 	},
 	strings.ToLower(SlowLogNumCopTasksStr): {
@@ -724,6 +755,9 @@ var SlowLogRuleFieldAccessors = map[string]SlowLogFieldAccessor{
 			items.CopTasks = copTasksDetail
 		},
 		Match: func(_ *SessionVars, items *SlowQueryLogItems, threshold any) bool {
+			if items.CopTasks == nil {
+				return matchZero(threshold)
+			}
 			return matchGE(threshold, int64(items.CopTasks.NumCopTasks))
 		},
 	},
@@ -773,7 +807,7 @@ var SlowLogRuleFieldAccessors = map[string]SlowLogFieldAccessor{
 			items.ResourceGroupName = seVars.StmtCtx.ResourceGroupName
 		},
 		Match: func(_ *SessionVars, items *SlowQueryLogItems, threshold any) bool {
-			return MatchEqual(threshold, strings.ToLower(items.ResourceGroupName))
+			return MatchEqual(strings.ToLower(threshold.(string)), strings.ToLower(items.ResourceGroupName))
 		},
 	},
 	// The following fields are related to util.ExecDetails.
@@ -803,99 +837,92 @@ var SlowLogRuleFieldAccessors = map[string]SlowLogFieldAccessor{
 	strings.ToLower(execdetails.TotalKeysStr): makeExecDetailAccessor(
 		parseUint64,
 		func(d *execdetails.ExecDetails, threshold any) bool {
-			return matchGE(threshold, d.ScanDetail.TotalKeys)
+			if d.ScanDetail == nil {
+				return matchZero(threshold)
+			}
+			totalKeys, ok := uint64FromNonNegative(d.ScanDetail.TotalKeys)
+			return ok && matchGE(threshold, totalKeys)
 		}),
 	strings.ToLower(execdetails.ProcessKeysStr): makeExecDetailAccessor(
 		parseUint64,
 		func(d *execdetails.ExecDetails, threshold any) bool {
-			return matchGE(threshold, d.ScanDetail.ProcessedKeys)
+			if d.ScanDetail == nil {
+				return matchZero(threshold)
+			}
+			processedKeys, ok := uint64FromNonNegative(d.ScanDetail.ProcessedKeys)
+			return ok && matchGE(threshold, processedKeys)
+		}),
+	strings.ToLower(SlowLogCopMVCCReadAmplification): makeExecDetailAccessor(
+		parseFloat64,
+		func(d *execdetails.ExecDetails, threshold any) bool {
+			if d.ScanDetail == nil || d.ScanDetail.ProcessedKeys <= 0 {
+				return matchZero(threshold)
+			}
+			return matchGE(threshold, float64(d.ScanDetail.TotalKeys)/float64(d.ScanDetail.ProcessedKeys))
+		}),
+	strings.ToLower(SlowLogCopMVCCReadAmplification): makeExecDetailAccessor(
+		parseFloat64,
+		func(d *execdetails.ExecDetails, threshold any) bool {
+			if d.ScanDetail == nil || d.ScanDetail.ProcessedKeys <= 0 {
+				return matchZero(threshold)
+			}
+			return matchGE(threshold, float64(d.ScanDetail.TotalKeys)/float64(d.ScanDetail.ProcessedKeys))
 		}),
 	strings.ToLower(execdetails.PreWriteTimeStr): makeExecDetailAccessor(
 		parseFloat64,
 		func(d *execdetails.ExecDetails, threshold any) bool {
+			if d.CommitDetail == nil {
+				return matchZero(threshold)
+			}
 			return matchGE(threshold, d.CommitDetail.PrewriteTime.Seconds())
 		}),
 	strings.ToLower(execdetails.CommitTimeStr): makeExecDetailAccessor(
 		parseFloat64,
 		func(d *execdetails.ExecDetails, threshold any) bool {
+			if d.CommitDetail == nil {
+				return matchZero(threshold)
+			}
 			return matchGE(threshold, d.CommitDetail.CommitTime.Seconds())
 		}),
 	strings.ToLower(execdetails.WriteKeysStr): makeExecDetailAccessor(
 		parseUint64,
 		func(d *execdetails.ExecDetails, threshold any) bool {
-			return matchGE(threshold, int64(d.CommitDetail.WriteKeys))
+			if d.CommitDetail == nil {
+				return matchZero(threshold)
+			}
+			writeKeys, ok := uint64FromNonNegative(int64(d.CommitDetail.WriteKeys))
+			return ok && matchGE(threshold, writeKeys)
 		}),
 	strings.ToLower(execdetails.WriteSizeStr): makeExecDetailAccessor(
 		parseUint64,
 		func(d *execdetails.ExecDetails, threshold any) bool {
-			return matchGE(threshold, int64(d.CommitDetail.WriteSize))
+			if d.CommitDetail == nil {
+				return matchZero(threshold)
+			}
+			writeSize, ok := uint64FromNonNegative(int64(d.CommitDetail.WriteSize))
+			return ok && matchGE(threshold, writeSize)
 		}),
 	strings.ToLower(execdetails.PrewriteRegionStr): makeExecDetailAccessor(
 		parseUint64,
 		func(d *execdetails.ExecDetails, threshold any) bool {
-			return matchGE(threshold, int64(atomic.LoadInt32(&d.CommitDetail.PrewriteRegionNum)))
+			if d.CommitDetail == nil {
+				return matchZero(threshold)
+			}
+			prewriteRegionNum := atomic.LoadInt32(&d.CommitDetail.PrewriteRegionNum)
+			prewriteRegion, ok := uint64FromNonNegative(int64(prewriteRegionNum))
+			return ok && matchGE(threshold, prewriteRegion)
 		}),
 }
 
 // slowLogFieldRe is uses to compile field:value
 var slowLogFieldRe = regexp.MustCompile(`\s*(\w+)\s*:\s*([^,]+)\s*`)
 
-// ParseSlowLogRules parses a raw slow log rules string into a structured SlowLogRules object.
-// Each rule is separated by a semicolon (';'), and within each rule, fields are separated by commas (',').
-// Each field is a key-value pair separated by a colon (':').
-// Example:
+// UnsetConnID is a sentinel value (-1) for slow log rules without an explicit connection binding.
 //
-//	"field1:val1,field2:val2;field2:val2,field3:val3;field4:val4"
-func ParseSlowLogRules(rawRules string) (*SlowLogRules, error) {
-	rawRules = strings.TrimSpace(rawRules)
-	if rawRules == "" {
-		return nil, nil
-	}
-
-	rules := strings.Split(rawRules, ";")
-	if len(rules) > 10 {
-		return nil, errors.Errorf("invalid slow log rules count:%d, limit is 10", len(rules))
-	}
-
-	slowLogRules := &SlowLogRules{
-		AllConditionFields: make(map[string]struct{}),
-		Rules:              make([]SlowLogRule, 0, len(rules))}
-	for _, rule := range rules {
-		rule = strings.TrimSpace(rule)
-		if rule == "" {
-			continue
-		}
-
-		matches := slowLogFieldRe.FindAllStringSubmatch(rule, -1)
-		if len(matches) == 0 {
-			return nil, fmt.Errorf("invalid slow log rule format:%s", rule)
-		}
-		fieldMap := make(map[string]any, len(matches))
-		for _, match := range matches {
-			if len(match) != 3 {
-				return nil, errors.Errorf("invalid slow log condition format:%s", match)
-			}
-
-			fieldName := strings.ToLower(strings.TrimSpace(match[1]))
-			value := strings.TrimSpace(match[2])
-			fieldValue, err := ParseSlowLogFieldValue(fieldName, strings.Trim(value, "\"'"))
-			if err != nil {
-				return nil, errors.Errorf("invalid slow log format, value:%s, err:%s", value, err)
-			}
-			fieldMap[fieldName] = fieldValue
-		}
-		slowLogRule := SlowLogRule{Conditions: make([]SlowLogCondition, 0, len(fieldMap))}
-		for fieldName, fieldValue := range fieldMap {
-			slowLogRule.Conditions = append(slowLogRule.Conditions, SlowLogCondition{
-				Field:     fieldName,
-				Threshold: fieldValue,
-			})
-			slowLogRules.AllConditionFields[fieldName] = struct{}{}
-		}
-		slowLogRules.Rules = append(slowLogRules.Rules, slowLogRule)
-	}
-	return slowLogRules, nil
-}
+// Semantics:
+//   - Session scope: represents the current session.
+//   - Global scope: means no specific connection ID is set, i.e. the rule applies globally.
+const UnsetConnID = int64(-1)
 
 // ParseSlowLogFieldValue is exporting for testing.
 func ParseSlowLogFieldValue(fieldName string, value string) (any, error) {
@@ -905,4 +932,164 @@ func ParseSlowLogFieldValue(fieldName string, value string) (any, error) {
 	}
 
 	return parser.Parse(value)
+}
+
+func parseSlowLogRuleEntry(rawRule string, allowConnID bool) (int64, *slowlogrule.SlowLogRule, error) {
+	connID := UnsetConnID
+	rawRule = strings.TrimSpace(rawRule)
+	if rawRule == "" {
+		return connID, nil, nil
+	}
+
+	matches := slowLogFieldRe.FindAllStringSubmatch(rawRule, -1)
+	if len(matches) == 0 {
+		return connID, nil, fmt.Errorf("invalid slow log rule format:%s", rawRule)
+	}
+	fieldMap := make(map[string]any, len(matches))
+	for _, match := range matches {
+		if len(match) != 3 {
+			return connID, nil, errors.Errorf("invalid slow log condition format:%s", match)
+		}
+
+		fieldName := strings.ToLower(strings.TrimSpace(match[1]))
+		value := strings.TrimSpace(match[2])
+		fieldValue, err := ParseSlowLogFieldValue(fieldName, strings.Trim(value, "\"'"))
+		if err != nil {
+			return connID, nil, errors.Errorf("invalid slow log format, value:%s, err:%s", value, err)
+		}
+
+		if strings.EqualFold(fieldName, SlowLogConnIDStr) {
+			if !allowConnID {
+				return connID, nil, errors.Errorf("do not allow ConnID value:%s", value)
+			}
+
+			connID = int64(fieldValue.(uint64))
+		}
+
+		fieldMap[fieldName] = fieldValue
+	}
+
+	slowLogRule := &slowlogrule.SlowLogRule{Conditions: make([]slowlogrule.SlowLogCondition, 0, len(fieldMap))}
+	for fieldName, fieldValue := range fieldMap {
+		slowLogRule.Conditions = append(slowLogRule.Conditions, slowlogrule.SlowLogCondition{
+			Field:     fieldName,
+			Threshold: fieldValue,
+		})
+	}
+
+	return connID, slowLogRule, nil
+}
+
+// parseSlowLogRuleSet parses a raw slow log rules string into a map keyed by ConnID.
+// Input format:
+//   - Multiple rules are separated by semicolons (';').
+//   - Inside each rule, fields are expressed as key:value pairs, separated by commas (',').
+//   - Example: "field1:val1,field2:val2;field3:val3"
+//
+// Behavior:
+//   - Returns a map where the key is ConnID, and the value is a set of rules for that ConnID.
+//   - UnsetConnID (-1) is used for rules not bound to a specific connection.
+//   - If allowConnID is false, rules containing an explicit ConnID will be rejected.
+func parseSlowLogRuleSet(rawRules string, allowConnID bool) (map[int64]*slowlogrule.SlowLogRules, error) {
+	rawRules = strings.TrimSpace(rawRules)
+	if rawRules == "" {
+		return nil, nil
+	}
+	rules := strings.Split(rawRules, ";")
+	if len(rules) > 10 {
+		return nil, errors.Errorf("invalid slow log rules count:%d, limit is 10", len(rules))
+	}
+
+	result := make(map[int64]*slowlogrule.SlowLogRules)
+	for _, raw := range rules {
+		connID, slowLogRule, err := parseSlowLogRuleEntry(raw, allowConnID)
+		if err != nil {
+			return nil, err
+		}
+		if slowLogRule == nil {
+			continue
+		}
+
+		slowLogRules, ok := result[connID]
+		if !ok {
+			slowLogRules = &slowlogrule.SlowLogRules{
+				Fields: make(map[string]struct{}),
+				Rules:  make([]*slowlogrule.SlowLogRule, 0, len(rules)),
+			}
+			result[connID] = slowLogRules
+		}
+		for _, cond := range slowLogRule.Conditions {
+			slowLogRules.Fields[cond.Field] = struct{}{}
+		}
+		slowLogRules.Rules = append(slowLogRules.Rules, slowLogRule)
+	}
+	return result, nil
+}
+
+// ParseSessionSlowLogRules parses raw rules into the default (UnsetConnID) slow log rules.
+// Returns nil if no rules for UnsetConnID are found.
+func ParseSessionSlowLogRules(rawRules string) (*slowlogrule.SlowLogRules, error) {
+	globalRules, err := parseSlowLogRuleSet(rawRules, false)
+	if err != nil {
+		return nil, err
+	}
+	if globalRules == nil || globalRules[UnsetConnID] == nil {
+		return nil, nil
+	}
+
+	globalRules[UnsetConnID].RawRules = encodeRules(globalRules[UnsetConnID])
+
+	return globalRules[UnsetConnID], nil
+}
+
+func encodeRules(rules *slowlogrule.SlowLogRules) string {
+	if rules == nil || len(rules.Rules) == 0 {
+		return ""
+	}
+
+	var strB strings.Builder
+	for i, rule := range rules.Rules {
+		for j, cond := range rule.Conditions {
+			if j > 0 {
+				strB.WriteByte(',')
+			}
+			strB.WriteString(cond.Field)
+			strB.WriteByte(':')
+			strB.WriteString(fmt.Sprintf("%v", cond.Threshold))
+		}
+
+		if i < len(rules.Rules)-1 {
+			strB.WriteByte(';')
+		}
+	}
+
+	return strB.String()
+}
+
+var crc64Table = crc64.MakeTable(crc64.ECMA)
+
+// ParseGlobalSlowLogRules parses raw rules and constructs a GlobalSlowLogRules object.
+// The result contains both the raw string and the rules map keyed by ConnID.
+// allowConnID = true is used here to support both ConnID-bound and default rules.
+func ParseGlobalSlowLogRules(rawRules string) (*slowlogrule.GlobalSlowLogRules, error) {
+	rulesMap, err := parseSlowLogRuleSet(rawRules, true)
+	if err != nil {
+		return nil, err
+	}
+
+	if rulesMap == nil {
+		rulesMap = make(map[int64]*slowlogrule.SlowLogRules)
+	}
+
+	rawSlice := make([]string, 0, len(rulesMap))
+	for _, rules := range rulesMap {
+		rawSlice = append(rawSlice, encodeRules(rules))
+	}
+
+	rawRules = strings.Join(rawSlice, ";")
+	return &slowlogrule.GlobalSlowLogRules{
+		RawRules:     rawRules,
+		RawRulesHash: crc64.Checksum([]byte(rawRules), crc64Table),
+		RulesMap:     rulesMap,
+	}, nil
 }

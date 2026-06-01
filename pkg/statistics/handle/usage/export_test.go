@@ -1,4 +1,4 @@
-// Copyright 2019 PingCAP, Inc.
+// Copyright 2026 PingCAP, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//go:build dev
+package usage
 
-package web
+import "time"
 
-import (
-	"net/http"
-)
+// GetDumpStatsMaxDurationForTest exposes dumpStatsMaxDuration for tests.
+func GetDumpStatsMaxDurationForTest() time.Duration {
+	return dumpStatsMaxDuration
+}
 
-// Res is the web resources.
-var Res http.FileSystem = http.Dir("lightning/web/dist")
+// SetDumpStatsMaxDurationForTest updates dumpStatsMaxDuration for tests.
+func SetDumpStatsMaxDurationForTest(d time.Duration) {
+	dumpStatsMaxDuration = d
+}

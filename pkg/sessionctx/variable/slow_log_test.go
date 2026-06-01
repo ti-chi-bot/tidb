@@ -16,28 +16,29 @@ package variable_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/pingcap/tidb/pkg/executor"
-	"github.com/pingcap/tidb/pkg/parser"
 	"github.com/pingcap/tidb/pkg/sessionctx"
+	"github.com/pingcap/tidb/pkg/sessionctx/slowlogrule"
 	"github.com/pingcap/tidb/pkg/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/pkg/sessionctx/variable"
-	"github.com/pingcap/tidb/pkg/testkit"
+	"github.com/pingcap/tidb/pkg/util/execdetails"
 	"github.com/pingcap/tidb/pkg/util/mock"
 	"github.com/stretchr/testify/require"
-	"github.com/tikv/client-go/v2/oracle"
+	"github.com/tikv/client-go/v2/util"
 )
 
 func newMockCtx() sessionctx.Context {
 	ctx := mock.NewContext()
 	ctx.GetSessionVars().StmtCtx = stmtctx.NewStmtCtx()
-	ctx.GetSessionVars().SlowLogRules = &variable.SlowLogRules{
-		Rules:              []variable.SlowLogRule{},
-		AllConditionFields: make(map[string]struct{}),
-	}
+	ctx.GetSessionVars().SlowLogRules = slowlogrule.NewSessionSlowLogRules(&slowlogrule.SlowLogRules{
+		Rules:  []*slowlogrule.SlowLogRule{},
+		Fields: make(map[string]struct{}),
+	})
 	return ctx
 }
 
@@ -66,40 +67,173 @@ func TestMatchSingleRuleSingleCondition(t *testing.T) {
 	ctx := newMockCtx()
 	items := &variable.SlowQueryLogItems{MemMax: 200}
 
-	rule := variable.SlowLogRule{
-		Conditions: []variable.SlowLogCondition{{
+	rule := &slowlogrule.SlowLogRule{
+		Conditions: []slowlogrule.SlowLogCondition{{
 			Field:     variable.SlowLogMemMax,
 			Threshold: int64(100),
 		}},
 	}
-	ctx.GetSessionVars().SlowLogRules.Rules = []variable.SlowLogRule{rule}
+	ctx.GetSessionVars().SlowLogRules.Rules = []*slowlogrule.SlowLogRule{rule}
 
-	require.True(t, executor.Match(ctx.GetSessionVars(), items)) // 200 >= 100
+	require.True(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules)) // 200 >= 100
 	items.MemMax = 50
-	require.False(t, executor.Match(ctx.GetSessionVars(), items)) // 50 < 100
+	require.False(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules)) // 50 < 100
+}
+
+func TestMatchSpecialTypeConditions(t *testing.T) {
+	ctx := newMockCtx()
+	items := &variable.SlowQueryLogItems{
+		Succ:              true,
+		Digest:            "abc",
+		ResourceGroupName: "rg_Test",
+	}
+
+	checkRet := func(expectMatch bool, condition slowlogrule.SlowLogCondition) {
+		rule := &slowlogrule.SlowLogRule{
+			Conditions: []slowlogrule.SlowLogCondition{
+				condition,
+			},
+		}
+		ctx.GetSessionVars().SlowLogRules.Rules = []*slowlogrule.SlowLogRule{rule}
+
+		if expectMatch {
+			require.True(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+		} else {
+			require.False(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+		}
+	}
+
+	t.Run("string type", func(t *testing.T) {
+		ctx.GetSessionVars().CurrentDB = "db_Test"
+		ctx.GetSessionVars().SessionAlias = "seA"
+		rule := &slowlogrule.SlowLogRule{
+			Conditions: []slowlogrule.SlowLogCondition{
+				{Field: variable.SlowLogSucc, Threshold: true},
+				{Field: variable.SlowLogDigestStr, Threshold: "abc"},
+				{Field: variable.SlowLogResourceGroup, Threshold: "rg_test"},
+				{Field: variable.SlowLogDBStr, Threshold: "db_test"},
+				{Field: variable.SlowLogSessAliasStr, Threshold: "seA"},
+			},
+		}
+		ctx.GetSessionVars().SlowLogRules.Rules = []*slowlogrule.SlowLogRule{rule}
+
+		require.True(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+
+		// test SessionAlias
+		ctx.GetSessionVars().SessionAlias = "sea"
+		require.False(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+		// test Digest
+		ctx.GetSessionVars().SessionAlias = "seA"
+		items.Digest = "abC"
+		require.False(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+
+		// test Rewrite_time field
+		// test with zero value (RewriteInfo not set)
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogRewriteTimeStr, Threshold: 0.0})
+		checkRet(false, slowlogrule.SlowLogCondition{Field: variable.SlowLogRewriteTimeStr, Threshold: 0.00000001})
+		// set RewritePhaseInfo and use Setter to populate items.RewriteInfo
+		ctx.GetSessionVars().RewritePhaseInfo.DurationRewrite = 5 * time.Millisecond
+		accessor := variable.SlowLogRuleFieldAccessors[strings.ToLower(variable.SlowLogRewriteTimeStr)]
+		accessor.Setter(context.Background(), ctx.GetSessionVars(), items)
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogRewriteTimeStr, Threshold: 0.001})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogRewriteTimeStr, Threshold: 0.0})
+		checkRet(false, slowlogrule.SlowLogCondition{Field: variable.SlowLogRewriteTimeStr, Threshold: 0.01})
+		// test reset DurationRewrite with smaller value (should not match larger threshold)
+		items.RewriteInfo.DurationRewrite = 500 * time.Microsecond
+		checkRet(false, slowlogrule.SlowLogCondition{Field: variable.SlowLogRewriteTimeStr, Threshold: 0.001})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogRewriteTimeStr, Threshold: 0.0001})
+	})
+
+	t.Run("util.ExecDetails type", func(t *testing.T) {
+		checkRet(false, slowlogrule.SlowLogCondition{Field: variable.SlowLogKVTotal, Threshold: 0.00000001})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogKVTotal, Threshold: 0.0})
+		tikvExecDetail := util.ExecDetails{
+			WaitKVRespDuration: (10 * time.Second).Nanoseconds(),
+		}
+		childCtx := context.WithValue(context.Background(), util.ExecDetailsKey, &tikvExecDetail)
+		accessor := variable.SlowLogRuleFieldAccessors[strings.ToLower(variable.SlowLogKVTotal)]
+		accessor.Setter(childCtx, nil, items)
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogKVTotal, Threshold: 0.00000001})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogKVTotal, Threshold: 0.0})
+	})
+
+	t.Run("execdetails.ExecDetails type", func(t *testing.T) {
+		seVar := ctx.GetSessionVars()
+		seVar.StmtCtx.SyncExecDetails.Reset()
+
+		checkRet(false, slowlogrule.SlowLogCondition{Field: execdetails.ProcessTimeStr, Threshold: float64(1)})
+		checkRet(false, slowlogrule.SlowLogCondition{Field: execdetails.TotalKeysStr, Threshold: uint64(2)})
+		checkRet(false, slowlogrule.SlowLogCondition{Field: variable.SlowLogCopMVCCReadAmplification, Threshold: 0.00000001})
+		checkRet(false, slowlogrule.SlowLogCondition{Field: execdetails.PreWriteTimeStr, Threshold: 0.123})
+		checkRet(false, slowlogrule.SlowLogCondition{Field: execdetails.PrewriteRegionStr, Threshold: uint64(4)})
+		// ExecDetail == nil
+		checkRet(true, slowlogrule.SlowLogCondition{Field: execdetails.ProcessTimeStr, Threshold: float64(0)})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: execdetails.TotalKeysStr, Threshold: uint64(0)})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogCopMVCCReadAmplification, Threshold: 0.0})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: execdetails.PreWriteTimeStr, Threshold: 0.0})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: execdetails.PrewriteRegionStr, Threshold: uint64(0)})
+		// ExecDetail != nil && d.CommitDetail == nil && d.ScanDetail == nil
+		accessor := variable.SlowLogRuleFieldAccessors[strings.ToLower(execdetails.TotalKeysStr)]
+		accessor.Setter(context.Background(), seVar, items)
+		copExecDetail := &execdetails.CopExecDetails{BackoffTime: time.Millisecond}
+		seVar.StmtCtx.SyncExecDetails.MergeCopExecDetails(copExecDetail, 0)
+		checkRet(true, slowlogrule.SlowLogCondition{Field: execdetails.ProcessTimeStr, Threshold: float64(0)})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: execdetails.TotalKeysStr, Threshold: uint64(0)})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogCopMVCCReadAmplification, Threshold: 0.0})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: execdetails.PreWriteTimeStr, Threshold: 0.0})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: execdetails.PrewriteRegionStr, Threshold: uint64(0)})
+
+		// ExecDetail != nil && d.ScanDetail != nil
+		seVar.StmtCtx.SyncExecDetails.Reset()
+		copExecDetail = &execdetails.CopExecDetails{
+			ScanDetail: util.ScanDetail{
+				ProcessedKeys: 10,
+				TotalKeys:     100,
+			},
+		}
+		seVar.StmtCtx.SyncExecDetails.MergeCopExecDetails(copExecDetail, 0)
+		items.ExecDetail = nil
+		accessor.Setter(context.Background(), seVar, items)
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogCopMVCCReadAmplification, Threshold: 9.99})
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogCopMVCCReadAmplification, Threshold: 10.0})
+		checkRet(false, slowlogrule.SlowLogCondition{Field: variable.SlowLogCopMVCCReadAmplification, Threshold: 10.01})
+
+		// ProcessedKeys == 0 follows scheme A: only threshold == 0 can match.
+		items.ExecDetail.ScanDetail.ProcessedKeys = 0
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogCopMVCCReadAmplification, Threshold: 0.0})
+		checkRet(false, slowlogrule.SlowLogCondition{Field: variable.SlowLogCopMVCCReadAmplification, Threshold: 0.01})
+
+		// TotalKeys == 0 and ProcessedKeys > 0: ratio is 0.
+		items.ExecDetail.ScanDetail.TotalKeys = 0
+		items.ExecDetail.ScanDetail.ProcessedKeys = 10
+		checkRet(true, slowlogrule.SlowLogCondition{Field: variable.SlowLogCopMVCCReadAmplification, Threshold: 0.0})
+		checkRet(false, slowlogrule.SlowLogCondition{Field: variable.SlowLogCopMVCCReadAmplification, Threshold: 0.01})
+	})
 }
 
 func TestMatchSingleRuleMultipleConditions(t *testing.T) {
 	ctx := newMockCtx()
 	items := &variable.SlowQueryLogItems{
-		MemMax: 200,
-		Digest: "abc",
-		Succ:   true,
+		MemMax:            200,
+		Digest:            "abc",
+		Succ:              true,
+		WriteSQLRespTotal: 1.5e6, // time.Duration
 	}
 
-	rule := variable.SlowLogRule{
-		Conditions: []variable.SlowLogCondition{
+	rule := &slowlogrule.SlowLogRule{
+		Conditions: []slowlogrule.SlowLogCondition{
 			{Field: variable.SlowLogMemMax, Threshold: int64(100)},
 			{Field: variable.SlowLogDigestStr, Threshold: "abc"},
 			{Field: variable.SlowLogSucc, Threshold: true},
+			{Field: variable.SlowLogWriteSQLRespTotal, Threshold: 0.0015},
 		},
 	}
-	ctx.GetSessionVars().SlowLogRules.Rules = []variable.SlowLogRule{rule}
+	ctx.GetSessionVars().SlowLogRules.Rules = []*slowlogrule.SlowLogRule{rule}
 
-	require.True(t, executor.Match(ctx.GetSessionVars(), items))
+	require.True(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
 
 	items.Succ = false
-	require.False(t, executor.Match(ctx.GetSessionVars(), items))
+	require.False(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
 }
 
 func TestMatchMultipleRulesOR(t *testing.T) {
@@ -112,37 +246,37 @@ func TestMatchMultipleRulesOR(t *testing.T) {
 	items.MemMax = 200
 
 	// rule 1: requires ExecRetryCount >= 3 AND Succ == true
-	rule1 := variable.SlowLogRule{
-		Conditions: []variable.SlowLogCondition{
+	rule1 := &slowlogrule.SlowLogRule{
+		Conditions: []slowlogrule.SlowLogCondition{
 			{Field: variable.SlowLogExecRetryCount, Threshold: uint64(3)},
 			{Field: variable.SlowLogSucc, Threshold: true},
 		},
 	}
 	// rule 2: requires MemMax >= 500 (not satisfied)
-	rule2 := variable.SlowLogRule{
-		Conditions: []variable.SlowLogCondition{
+	rule2 := &slowlogrule.SlowLogRule{
+		Conditions: []slowlogrule.SlowLogCondition{
 			{Field: variable.SlowLogMemMax, Threshold: int64(500)},
 		},
 	}
 
-	sessVars.SlowLogRules = &variable.SlowLogRules{Rules: []variable.SlowLogRule{rule1, rule2}}
+	sessVars.SlowLogRules = slowlogrule.NewSessionSlowLogRules(&slowlogrule.SlowLogRules{Rules: []*slowlogrule.SlowLogRule{rule1, rule2}})
 
 	// should match rule1, return true
-	require.True(t, executor.Match(ctx.GetSessionVars(), items))
+	require.True(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
 
 	// change ExecRetryCount smaller -> no match
 	items.ExecRetryCount = 1
-	require.False(t, executor.Match(ctx.GetSessionVars(), items))
+	require.False(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
 
 	// test string matching
 	items.Digest = "plan_digest"
-	rule3 := variable.SlowLogRule{
-		Conditions: []variable.SlowLogCondition{
+	rule3 := &slowlogrule.SlowLogRule{
+		Conditions: []slowlogrule.SlowLogCondition{
 			{Field: variable.SlowLogDigestStr, Threshold: "plan_digest"},
 		},
 	}
-	sessVars.SlowLogRules = &variable.SlowLogRules{Rules: []variable.SlowLogRule{rule3}}
-	require.True(t, executor.Match(ctx.GetSessionVars(), items))
+	sessVars.SlowLogRules = slowlogrule.NewSessionSlowLogRules(&slowlogrule.SlowLogRules{Rules: []*slowlogrule.SlowLogRule{rule3}})
+	require.True(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
 }
 
 func TestMatchDifferentTypesAfterParse(t *testing.T) {
@@ -156,14 +290,74 @@ func TestMatchDifferentTypesAfterParse(t *testing.T) {
 		TimeTotal:         3140 * time.Millisecond, // time.Duration
 	}
 
-	slowLogRules, err := variable.ParseSlowLogRules(`Mem_max: 100, Exec_retry_count: 300, Succ: true, Query_time: 2.52, Resource_group: rg1`)
+	slowLogRules, err := variable.ParseSessionSlowLogRules(`Mem_max: 100, Exec_retry_count: 300, Succ: true, Query_time: 2.52, Resource_group: rg1`)
 	require.NoError(t, err)
-	ctx.GetSessionVars().SlowLogRules = slowLogRules
-	require.True(t, executor.Match(ctx.GetSessionVars(), items))
+	ctx.GetSessionVars().SlowLogRules.SlowLogRules = slowLogRules
+	require.True(t, executor.Match(ctx.GetSessionVars(), items, ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+}
+
+func TestMatchUintExecDetailFieldsAfterParse(t *testing.T) {
+	t.Run("commit fields", func(t *testing.T) {
+		ctx := newMockCtx()
+		rules, err := variable.ParseSessionSlowLogRules("Write_keys:1,Write_size:2,Prewrite_region:3")
+		require.NoError(t, err)
+		ctx.GetSessionVars().SlowLogRules.SlowLogRules = rules
+
+		newItems := func(writeKeys, writeSize int, prewriteRegionNum int32) *variable.SlowQueryLogItems {
+			return &variable.SlowQueryLogItems{
+				ExecDetail: &execdetails.ExecDetails{
+					CommitDetail: &util.CommitDetails{
+						WriteKeys:         writeKeys,
+						WriteSize:         writeSize,
+						PrewriteRegionNum: prewriteRegionNum,
+					},
+				},
+			}
+		}
+
+		require.True(t, executor.Match(ctx.GetSessionVars(), newItems(2, 3, 4), ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+
+		t.Run("negative write_keys", func(t *testing.T) {
+			require.False(t, executor.Match(ctx.GetSessionVars(), newItems(-1, 3, 4), ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+		})
+		t.Run("negative write_size", func(t *testing.T) {
+			require.False(t, executor.Match(ctx.GetSessionVars(), newItems(2, -1, 4), ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+		})
+		t.Run("negative prewrite_region", func(t *testing.T) {
+			require.False(t, executor.Match(ctx.GetSessionVars(), newItems(2, 3, -1), ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+		})
+	})
+
+	t.Run("scan fields", func(t *testing.T) {
+		ctx := newMockCtx()
+		rules, err := variable.ParseSessionSlowLogRules("Total_keys:1,Process_keys:2")
+		require.NoError(t, err)
+		ctx.GetSessionVars().SlowLogRules.SlowLogRules = rules
+
+		newItems := func(totalKeys, processedKeys int64) *variable.SlowQueryLogItems {
+			return &variable.SlowQueryLogItems{
+				ExecDetail: &execdetails.ExecDetails{
+					ScanDetail: &util.ScanDetail{
+						TotalKeys:     totalKeys,
+						ProcessedKeys: processedKeys,
+					},
+				},
+			}
+		}
+
+		require.True(t, executor.Match(ctx.GetSessionVars(), newItems(2, 3), ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+
+		t.Run("negative total_keys", func(t *testing.T) {
+			require.False(t, executor.Match(ctx.GetSessionVars(), newItems(-1, 3), ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+		})
+		t.Run("negative process_keys", func(t *testing.T) {
+			require.False(t, executor.Match(ctx.GetSessionVars(), newItems(2, -1), ctx.GetSessionVars().SlowLogRules.SlowLogRules))
+		})
+	})
 }
 
 func TestParseSingleSlowLogField(t *testing.T) {
-	require.Equal(t, 29, len(variable.SlowLogRuleFieldAccessors))
+	require.Equal(t, 31, len(variable.SlowLogRuleFieldAccessors))
 	accessor, ok := variable.SlowLogRuleFieldAccessors[strings.ToLower(variable.SlowLogPlanDigest)]
 	require.True(t, ok)
 	require.NotNil(t, accessor.Setter)
@@ -189,9 +383,38 @@ func TestParseSingleSlowLogField(t *testing.T) {
 	v, err = variable.ParseSlowLogFieldValue(variable.SlowLogQueryTimeStr, "1.234")
 	require.NoError(t, err)
 	require.Equal(t, 1.234, v)
+	v, err = variable.ParseSlowLogFieldValue(variable.SlowLogQueryTimeStr, "1.5e6")
+	require.NoError(t, err)
+	require.Equal(t, 1.5e6, v)
+	v, err = variable.ParseSlowLogFieldValue(variable.SlowLogCopMVCCReadAmplification, "10.5")
+	require.NoError(t, err)
+	require.Equal(t, 10.5, v)
 
 	_, err = variable.ParseSlowLogFieldValue(variable.SlowLogQueryTimeStr, "abc")
 	require.Error(t, err)
+	_, err = variable.ParseSlowLogFieldValue(variable.SlowLogCopMVCCReadAmplification, "abc")
+	require.Error(t, err)
+
+	// negative float64 values should be rejected
+	_, err = variable.ParseSlowLogFieldValue(variable.SlowLogQueryTimeStr, "-1.5")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-negative")
+	_, err = variable.ParseSlowLogFieldValue(variable.SlowLogCopMVCCReadAmplification, "-0.1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-negative")
+	// zero is still valid
+	v, err = variable.ParseSlowLogFieldValue(variable.SlowLogQueryTimeStr, "0")
+	require.NoError(t, err)
+	require.Equal(t, float64(0), v)
+
+	// negative int64 values should be rejected
+	_, err = variable.ParseSlowLogFieldValue(variable.SlowLogMemMax, "-100")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-negative")
+	// zero is still valid
+	v, err = variable.ParseSlowLogFieldValue(variable.SlowLogMemMax, "0")
+	require.NoError(t, err)
+	require.Equal(t, int64(0), v)
 
 	// string fields
 	v, err = variable.ParseSlowLogFieldValue(variable.SlowLogDBStr, "testdb")
@@ -218,28 +441,37 @@ func TestParseSingleSlowLogField(t *testing.T) {
 	require.Nil(t, v)
 }
 
-func compareConditionsUnordered(t *testing.T, got, want []variable.SlowLogCondition) {
+func compareConditionsUnordered(t *testing.T, got, want []slowlogrule.SlowLogCondition, rawRule string) {
 	require.Equal(t, len(got), len(want))
 	gotMap := make(map[string]any, len(got))
 	for _, c := range got {
 		gotMap[strings.ToLower(c.Field)] = c.Threshold
 	}
+	rawRule = strings.ToLower(rawRule)
 	for _, c := range want {
-		val, ok := gotMap[strings.ToLower(c.Field)]
+		field := strings.ToLower(c.Field)
+		val, ok := gotMap[field]
 		require.True(t, ok)
+		kv := fmt.Sprintf("%s: %v", field, val)
+		require.True(t, strings.Contains(rawRule, kv),
+			fmt.Sprintf("rawRule:%v, substr: %s", rawRule, kv))
 		require.Equal(t, c.Threshold, val)
 	}
 }
 
-func TestParseSlowLogRules(t *testing.T) {
+func TestParseSessionSlowLogRules(t *testing.T) {
 	// normal tests
 	// a rule that ends without a ';'
-	slowLogRules, err := variable.ParseSlowLogRules(`Conn_ID: 123, DB: 'db1', Succ: true, Query_time: 0.5276, Resource_group: "rg1""`)
+	slowLogRules, err := variable.ParseSessionSlowLogRules(`Conn_ID: 123, DB: db1, Succ: true, Query_time: 0.5276, Resource_group: rg1`)
+	require.EqualError(t, err, "do not allow ConnID value:123")
+	require.Nil(t, slowLogRules)
+	rawRule := `Exec_retry_count: 10, DB: db1, Succ: true, Query_time: 0.5276, Resource_group: rg1`
+	slowLogRules, err = variable.ParseSessionSlowLogRules(rawRule)
 	require.NoError(t, err)
-	rules := []variable.SlowLogRule{
+	rules := []slowlogrule.SlowLogRule{
 		{
-			Conditions: []variable.SlowLogCondition{
-				{Field: strings.ToLower(variable.SlowLogConnIDStr), Threshold: uint64(123)},
+			Conditions: []slowlogrule.SlowLogCondition{
+				{Field: strings.ToLower(variable.SlowLogExecRetryCount), Threshold: uint64(10)},
 				{Field: strings.ToLower(variable.SlowLogDBStr), Threshold: "db1"},
 				{Field: strings.ToLower(variable.SlowLogSucc), Threshold: true},
 				{Field: strings.ToLower(variable.SlowLogQueryTimeStr), Threshold: 0.5276},
@@ -248,27 +480,28 @@ func TestParseSlowLogRules(t *testing.T) {
 		},
 	}
 	allConditionFields := map[string]struct{}{
-		strings.ToLower(variable.SlowLogConnIDStr):     {},
-		strings.ToLower(variable.SlowLogDBStr):         {},
-		strings.ToLower(variable.SlowLogSucc):          {},
-		strings.ToLower(variable.SlowLogQueryTimeStr):  {},
-		strings.ToLower(variable.SlowLogResourceGroup): {},
+		strings.ToLower(variable.SlowLogExecRetryCount): {},
+		strings.ToLower(variable.SlowLogDBStr):          {},
+		strings.ToLower(variable.SlowLogSucc):           {},
+		strings.ToLower(variable.SlowLogQueryTimeStr):   {},
+		strings.ToLower(variable.SlowLogResourceGroup):  {},
 	}
-	compareConditionsUnordered(t, rules[0].Conditions, slowLogRules.Rules[0].Conditions)
-	require.Equal(t, allConditionFields, slowLogRules.AllConditionFields)
+	compareConditionsUnordered(t, rules[0].Conditions, slowLogRules.Rules[0].Conditions, rawRule)
+	require.Equal(t, allConditionFields, slowLogRules.Fields)
 	// a rule that ends with a ';'
-	slowLogRules, err = variable.ParseSlowLogRules(`Conn_ID: 123, DB: db1, Succ: true, Query_time: 0.5276, Resource_group: rg1;`)
+	slowLogRules, err = variable.ParseSessionSlowLogRules(`Exec_retry_count: 10, DB: db1, Succ: true, Query_time: 0.5276, Resource_group: rg1;`)
 	require.NoError(t, err)
-	compareConditionsUnordered(t, rules[0].Conditions, slowLogRules.Rules[0].Conditions)
-	require.Equal(t, allConditionFields, slowLogRules.AllConditionFields)
+	compareConditionsUnordered(t, rules[0].Conditions, slowLogRules.Rules[0].Conditions, rawRule)
+	require.Equal(t, allConditionFields, slowLogRules.Fields)
 	// some rules
-	slowLogRules, err = variable.ParseSlowLogRules(`Conn_ID: 123, DB: db1, Succ: true, Query_time: 0.5276, Resource_group: rg1;
-		Conn_ID: 124, DB: db2, Succ: false, Query_time: 1.5276`)
+	rawRule1 := "Exec_retry_count: 123, DB: db1, Succ: true, Query_time: 0.5276, Resource_group: rg1;"
+	rawRule2 := "Exec_retry_count: 124, DB: db2, Succ: false, Query_time: 1.5276"
+	slowLogRules, err = variable.ParseSessionSlowLogRules(rawRule1 + rawRule2)
 	require.NoError(t, err)
-	rules = []variable.SlowLogRule{
+	rules = []slowlogrule.SlowLogRule{
 		{
-			Conditions: []variable.SlowLogCondition{
-				{Field: strings.ToLower(variable.SlowLogConnIDStr), Threshold: uint64(123)},
+			Conditions: []slowlogrule.SlowLogCondition{
+				{Field: strings.ToLower(variable.SlowLogExecRetryCount), Threshold: uint64(123)},
 				{Field: strings.ToLower(variable.SlowLogDBStr), Threshold: "db1"},
 				{Field: strings.ToLower(variable.SlowLogSucc), Threshold: true},
 				{Field: strings.ToLower(variable.SlowLogQueryTimeStr), Threshold: 0.5276},
@@ -276,50 +509,68 @@ func TestParseSlowLogRules(t *testing.T) {
 			},
 		},
 		{
-			Conditions: []variable.SlowLogCondition{
-				{Field: strings.ToLower(variable.SlowLogConnIDStr), Threshold: uint64(124)},
+			Conditions: []slowlogrule.SlowLogCondition{
+				{Field: strings.ToLower(variable.SlowLogExecRetryCount), Threshold: uint64(124)},
 				{Field: strings.ToLower(variable.SlowLogDBStr), Threshold: "db2"},
 				{Field: strings.ToLower(variable.SlowLogSucc), Threshold: false},
-				{Field: strings.ToLower(variable.SlowLogResourceGroup), Threshold: 1.5276},
+				{Field: strings.ToLower(variable.SlowLogQueryTimeStr), Threshold: 1.5276},
 			},
 		},
 	}
-	compareConditionsUnordered(t, rules[0].Conditions, slowLogRules.Rules[0].Conditions)
-	require.Equal(t, allConditionFields, slowLogRules.AllConditionFields)
+	compareConditionsUnordered(t, rules[0].Conditions, slowLogRules.Rules[0].Conditions, rawRule1)
+	compareConditionsUnordered(t, rules[1].Conditions, slowLogRules.Rules[1].Conditions, rawRule2)
+	require.Equal(t, allConditionFields, slowLogRules.Fields)
 
 	// return nil
-	slowLogRules, err = variable.ParseSlowLogRules("  ")
+	slowLogRules, err = variable.ParseSessionSlowLogRules("  ")
+	require.NoError(t, err)
+	require.Nil(t, slowLogRules)
+	slowLogRules, err = variable.ParseSessionSlowLogRules("  ; ; ")
 	require.NoError(t, err)
 	require.Nil(t, slowLogRules)
 
-	// return an empty rule
-	emptySlowLogRules := &variable.SlowLogRules{
-		AllConditionFields: make(map[string]struct{}),
-		Rules:              make([]variable.SlowLogRule, 0, len(rules))}
-	slowLogRules, err = variable.ParseSlowLogRules("  ; ; ")
-	require.NoError(t, err)
-	require.Equal(t, emptySlowLogRules, slowLogRules)
-
 	// exceeding the limit set by the rules
 	longRules := strings.Repeat("Conn_ID:1;", 11)
-	_, err = variable.ParseSlowLogRules(longRules)
+	_, err = variable.ParseSessionSlowLogRules(longRules)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "invalid slow log rules count")
 	// the field has ','
-	slowLogRules, err = variable.ParseSlowLogRules(`DB:"a,b", Succ:true`)
+	slowLogRules, err = variable.ParseSessionSlowLogRules(`DB:"a,b", Succ:true`)
 	require.NoError(t, err)
 	require.Equal(t, 2, len(slowLogRules.Rules[0].Conditions))
 
 	// Format error
-	_, err = variable.ParseSlowLogRules("Conn_ID 123")
+	_, err = variable.ParseSessionSlowLogRules("Exec_retry_count 123")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid slow log rule format:Conn_ID 123")
-	_, err = variable.ParseSlowLogRules("Conn_ID > 123")
+	require.Contains(t, err.Error(), "invalid slow log rule format:Exec_retry_count 123")
+	_, err = variable.ParseSessionSlowLogRules("Exec_retry_count > 123")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "invalid slow log rule format:Conn_ID > 123")
+	require.Contains(t, err.Error(), "invalid slow log rule format:Exec_retry_count > 123")
+
+	// Negative numeric thresholds should be rejected.
+	_, err = variable.ParseSessionSlowLogRules("Query_time:-1.5")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-negative")
+	_, err = variable.ParseSessionSlowLogRules("cop_mvcc_read_amplification:-0.1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-negative")
+	_, err = variable.ParseSessionSlowLogRules("Mem_max:-100")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "non-negative")
+
+	// Non-finite float thresholds should be rejected.
+	_, err = variable.ParseSessionSlowLogRules("Query_time:NaN")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "finite")
+	_, err = variable.ParseSessionSlowLogRules("Query_time:Inf")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "finite")
+	_, err = variable.ParseSessionSlowLogRules("cop_mvcc_read_amplification:+Inf")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "finite")
 
 	// Field resetting
-	slowLogRules, err = variable.ParseSlowLogRules("Mem_max:100,Succ:true,Succ:false,Mem_max:200")
+	slowLogRules, err = variable.ParseSessionSlowLogRules("Mem_max:100,Succ:true,Succ:false,Mem_max:200")
 	require.NoError(t, err)
 	require.Len(t, slowLogRules.Rules, 1)
 	m := make(map[string]any)
@@ -330,31 +581,104 @@ func TestParseSlowLogRules(t *testing.T) {
 	require.Equal(t, false, m[strings.ToLower(variable.SlowLogSucc)])
 
 	// empty fields in a single rule
-	slowLogRules, err = variable.ParseSlowLogRules("Conn_ID:1,  , DB:db")
+	slowLogRules, err = variable.ParseSessionSlowLogRules("Exec_retry_count:1,  , DB:db")
 	require.NoError(t, err)
 	require.Equal(t, 2, len(slowLogRules.Rules[0].Conditions))
 }
 
-func BenchmarkSlowLog(b *testing.B) {
-	b.StopTimer()
-	b.ReportAllocs()
-
-	store := testkit.CreateMockStore(b)
-	tk := testkit.NewTestKit(b, store)
-	tk.MustExec("use test")
-	tk.MustExec("create table t (id int primary key, v int)")
-	tk.MustExec("insert into t values (1,1), (2,2)")
-	se := tk.Session()
-	stmt, err := parser.New().ParseOneStmt("select * from t", "", "")
-	require.NoError(b, err)
-	compiler := executor.Compiler{Ctx: se}
-	execStmt, err := compiler.Compile(context.TODO(), stmt)
-	require.NoError(b, err)
-
-	ts := oracle.GoTimeToTS(time.Now())
-
-	b.StartTimer()
-	for i := 0; i < b.N; i++ {
-		execStmt.LogSlowQuery(ts, true, false)
+func checkRuleByField(t *testing.T, rules []*slowlogrule.SlowLogRule, field, val string) {
+	for _, r := range rules {
+		for _, cond := range r.Conditions {
+			if cond.Field == field {
+				require.Equal(t, cond.Threshold, val)
+			}
+		}
 	}
+}
+
+func TestParseGlobalSlowLogRules(t *testing.T) {
+	// normal tests
+	rawRule := `Conn_ID: 123, Exec_retry_count: 10, DB: db1, Succ: true, Query_time: 0.5276, Resource_group: rg1`
+	slowLogRuleSet, err := variable.ParseGlobalSlowLogRules(rawRule)
+	require.NoError(t, err)
+	rules := []slowlogrule.SlowLogRule{
+		{
+			Conditions: []slowlogrule.SlowLogCondition{
+				{Field: strings.ToLower(variable.SlowLogConnIDStr), Threshold: uint64(123)},
+				{Field: strings.ToLower(variable.SlowLogExecRetryCount), Threshold: uint64(10)},
+				{Field: strings.ToLower(variable.SlowLogDBStr), Threshold: "db1"},
+				{Field: strings.ToLower(variable.SlowLogSucc), Threshold: true},
+				{Field: strings.ToLower(variable.SlowLogQueryTimeStr), Threshold: 0.5276},
+				{Field: strings.ToLower(variable.SlowLogResourceGroup), Threshold: "rg1"},
+			},
+		},
+	}
+	allConditionFields := map[string]struct{}{
+		strings.ToLower(variable.SlowLogConnIDStr):      {},
+		strings.ToLower(variable.SlowLogExecRetryCount): {},
+		strings.ToLower(variable.SlowLogDBStr):          {},
+		strings.ToLower(variable.SlowLogSucc):           {},
+		strings.ToLower(variable.SlowLogQueryTimeStr):   {},
+		strings.ToLower(variable.SlowLogResourceGroup):  {},
+	}
+	require.NotNil(t, slowLogRuleSet)
+	require.Len(t, slowLogRuleSet.RulesMap, 1)
+	compareConditionsUnordered(t, rules[0].Conditions, slowLogRuleSet.RulesMap[123].Rules[0].Conditions, rawRule)
+	require.Equal(t, allConditionFields, slowLogRuleSet.RulesMap[123].Fields)
+	require.Nil(t, slowLogRuleSet.RulesMap[variable.UnsetConnID])
+
+	// empty raw rule returns empty map
+	slowLogRuleSet, err = variable.ParseGlobalSlowLogRules("")
+	require.NoError(t, err)
+	require.NotNil(t, slowLogRuleSet)
+	require.Empty(t, slowLogRuleSet.RulesMap)
+	require.Equal(t, "", slowLogRuleSet.RawRules)
+	require.Equal(t, uint64(0x0), slowLogRuleSet.RawRulesHash)
+
+	// special ConnID with empty raw rule
+	slowLogRuleSet, err = variable.ParseGlobalSlowLogRules("Conn_id:123;")
+	require.NoError(t, err)
+	require.NotNil(t, slowLogRuleSet)
+	require.Equal(t, slowLogRuleSet.RulesMap[123].Rules[0].Conditions[0].Threshold, uint64(123))
+	require.Equal(t, "conn_id:123", slowLogRuleSet.RawRules)
+
+	// invalid connID format
+	slowLogRuleSet, err = variable.ParseGlobalSlowLogRules("Conn_ID: -123, DB: db1;")
+	require.True(t, strings.Contains(err.Error(), "invalid slow log format"))
+	require.Nil(t, slowLogRuleSet)
+
+	// multiple rules with different ConnID
+	allConditionFields = map[string]struct{}{
+		strings.ToLower(variable.SlowLogConnIDStr): {},
+		strings.ToLower(variable.SlowLogDBStr):     {},
+	}
+	rawRule = `Conn_ID: 123, DB: db1; Conn_ID: 456, DB: db2; DB: db3; Conn_ID: 789; Conn_ID: 123;;`
+	slowLogRuleSet, err = variable.ParseGlobalSlowLogRules(rawRule)
+	require.NoError(t, err)
+	// the result raw rule(in uncertain order): conn_id:123,db:db1;conn_id:123;conn_id:456,db:db2;db:db3;conn_id:789
+	require.True(t, strings.Contains(slowLogRuleSet.RawRules, "conn_id:123,db:db1;conn_id:123") ||
+		strings.Contains(slowLogRuleSet.RawRules, "db:db1,conn_id:123;conn_id:123"))
+	require.True(t, strings.Contains(slowLogRuleSet.RawRules, "conn_id:456,db:db2") ||
+		strings.Contains(slowLogRuleSet.RawRules, "db:db2,conn_id:456"))
+	require.True(t, strings.Contains(slowLogRuleSet.RawRules, "db:db3"))
+	require.True(t, strings.Contains(slowLogRuleSet.RawRules, "conn_id:789"))
+	require.Len(t, slowLogRuleSet.RulesMap, 4)
+	// Conn_ID: 123
+	checkRuleByField(t, slowLogRuleSet.RulesMap[123].Rules, variable.SlowLogDBStr, "db1")
+	checkRuleByField(t, slowLogRuleSet.RulesMap[123].Rules, variable.SlowLogConnIDStr, "123")
+	require.Equal(t, "", slowLogRuleSet.RulesMap[123].RawRules)
+	require.Equal(t, allConditionFields, slowLogRuleSet.RulesMap[123].Fields)
+	// Conn_ID: 456
+	checkRuleByField(t, slowLogRuleSet.RulesMap[456].Rules, variable.SlowLogDBStr, "db2")
+	require.Equal(t, "", slowLogRuleSet.RulesMap[456].RawRules)
+	require.Equal(t, allConditionFields, slowLogRuleSet.RulesMap[456].Fields)
+	// Conn_ID: -1
+	require.Equal(t, "db3", slowLogRuleSet.RulesMap[variable.UnsetConnID].Rules[0].Conditions[0].Threshold)
+	require.Equal(t, "", slowLogRuleSet.RulesMap[variable.UnsetConnID].RawRules)
+	allConditionFields = map[string]struct{}{
+		strings.ToLower(variable.SlowLogDBStr): {},
+	}
+	require.Equal(t, allConditionFields, slowLogRuleSet.RulesMap[variable.UnsetConnID].Fields)
+	// Conn_ID: 789
+	require.Equal(t, uint64(789), slowLogRuleSet.RulesMap[789].Rules[0].Conditions[0].Threshold)
 }
